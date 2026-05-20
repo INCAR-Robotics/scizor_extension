@@ -1,0 +1,21 @@
+[project]
+name = "scizor_extension"
+version = "0.0.1"
+description = "SCIZOR two-pass data curation for INCAR imitation learning datasets"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "av",
+    "Pillow",
+    "tqdm",
+    "scikit-learn",
+    "huggingface_hub",
+    "cosmos-tokenizer @ git+https://github.com/NVIDIA/Cosmos-Tokenizer.git",
+]
+
+[tool.setuptools]
+packages = ["scizor_extension"]
+
+[project.entry-points.'incar_extensions.processing']
+scizor = 'scizor_extension'
