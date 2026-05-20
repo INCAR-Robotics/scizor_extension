@@ -66,7 +66,7 @@ At inference, each frame is scored in two stages (SCIZOR §3.2):
 ```
 # Stage 1 — even distribution
 V_i    = T*dt − T_predicted(feat_i, feat_{i+T})
-Vhat[j] += V_i / T   for every j in [i, i+T]
+Vhat[j] += V_i / (T+1)   for every j in [i, i+T]   # T+1 positions → mass preserved
 
 # Stage 2 — future-looking discounted sum
 score(j) = Σ_{k=0}^{T} γ^k · Vhat[j+k]
