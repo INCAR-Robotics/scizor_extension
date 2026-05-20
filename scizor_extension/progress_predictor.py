@@ -13,11 +13,11 @@ Training:
   - Pairs balanced across bins to avoid easy-bin collapse
   - AdamW lr=1e-4 (paper), ExponentialLR scheduler
 
-Scoring (SCIZOR §3.1):
-  - V_{i,i+T} = T_actual - T_predicted   (sub-trajectory suboptimality)
-  - Distributed as (1/T)*V to every frame in [i, i+T]
-  - Temporally discounted: γ^(distance from chunk start)
-  - Blended 50/50 with the per-demo mean score
+Scoring (SCIZOR §3.2):
+  - Stage 1: V_i = T*dt - T_predicted(feat_i, feat_{i+T}); distribute V_i/T
+             evenly across all frames in [i, i+T] → Vhat.
+  - Stage 2: score(j) = Σ_{k=0}^{T} γ^k · Vhat[j+k]  (future-looking discount)
+  - Stage 3: blend 50/50 with per-demo mean.
 """
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ class ProgressHead(nn.Module):
     def __init__(
         self,
         feat_dim:  int = 384,
-        num_layers: int = 4,
+        num_layers: int = 6,   # paper: 6
         num_heads:  int = 8,
     ):
         super().__init__()
@@ -175,7 +175,7 @@ def train_progress_predictor(
     lr: float = 1e-4,             # paper: 1e-4
     lr_gamma: float = 0.999,      # ExponentialLR decay per step
     feat_dim: int = 384,
-    num_layers: int = 4,
+    num_layers: int = 6,          # paper: 6
 ) -> ProgressHead:
     """
     Train and return a ProgressHead on pairs drawn from all demos.
@@ -231,45 +231,62 @@ def score_demo(
     model: ProgressHead,
     device: str,
     dt: float,
-    lookahead_steps: int = 5,
+    lookahead_steps: int,
     gamma: float = 0.9,
 ) -> np.ndarray:
     """
-    Compute per-frame suboptimality scores for one demo.
+    Compute per-frame suboptimality scores for one demo (SCIZOR §3.2).
 
-    Formula (SCIZOR §3.1):
-      1. For each lookahead k in [1 .. lookahead_steps]:
-           V_{i,i+k} = k*dt  −  T_predicted(feat_i, feat_{i+k})
-           Each frame t in [i, i+k] accumulates  γ^(t-i) * V/k
-      2. Blend with demo mean: score = 0.5 * local + 0.5 * mean(local)
+    Two-stage aggregation:
+      Stage 1 — even distribution: each sub-trajectory score
+        V_i = T*dt − T_predicted(feat_i, feat_{i+T})
+      is spread uniformly across the T+1 observation positions in [i, i+T]:
+        Vhat[j] += V_i / (T+1)  for every j in [i, i+T].
+      Dividing by T+1 preserves total mass (Σ contributions = V_i).
 
-    High score → suboptimal/idle frame.
-    Low score  → productive frame (predicted progress ≈ actual elapsed time).
+      Stage 2 — future-looking discounted sum: each frame accumulates
+      the discounted suboptimality of its own and future Vhat values:
+        score(j) = Σ_{k=0}^{T} γ^k · Vhat[j+k]
+      so earlier frames are penalised more by future suboptimality.
+
+      Stage 3 — blend with demo mean:
+        0.5 * score + 0.5 * mean(score).
+
+    High score → suboptimal/idle frame.  Low score → productive frame.
     """
     N = len(features)
-    raw = np.zeros(N, dtype=np.float64)
+    T = min(lookahead_steps, N - 1)
+    Vhat = np.zeros(N, dtype=np.float64)
+
+    if T < 1 or N < 2:
+        return Vhat.astype(np.float32)
 
     fi_t = torch.from_numpy(features).to(device)   # [N, D]
+    T_actual = T * dt
 
     model.eval()
     with torch.no_grad():
-        for k in range(1, lookahead_steps + 1):
-            if k >= N:
-                break
-            i_idx = np.arange(0, N - k)
-            j_idx = i_idx + k
-            T_actual = k * dt
+        i_idx  = np.arange(0, N - T)
+        j_idx  = i_idx + T
+        logits = model(fi_t[i_idx], fi_t[j_idx])        # [M, 5]
+        probs  = torch.softmax(logits, dim=-1).cpu().numpy()
+        T_pred = (probs * BIN_MIDS).sum(axis=1)          # expected seconds
+        V      = T_actual - T_pred                        # [M]
 
-            logits = model(fi_t[i_idx], fi_t[j_idx])        # [M, 5]
-            probs  = torch.softmax(logits, dim=-1).cpu().numpy()
-            T_pred = (probs * BIN_MIDS).sum(axis=1)          # expected seconds
+    # Stage 1: distribute V_i evenly across the T+1 observation positions [i, i+T].
+    # Dividing by T+1 (not T) preserves total mass: sum of contributions == V_i.
+    for step in range(T + 1):
+        Vhat[i_idx + step] += V / (T + 1)
 
-            V = T_actual - T_pred                            # [M]
+    # Stage 2: future-looking discounted sum over Vhat.
+    # raw[j] = Σ_{k=0}^{T} γ^k · Vhat[j+k]   (only valid j+k < N)
+    raw = np.zeros(N, dtype=np.float64)
+    for k in range(T + 1):
+        n = N - k
+        if n <= 0:
+            break
+        raw[:n] += (gamma ** k) * Vhat[k : k + n]
 
-            for step in range(k + 1):
-                discount = gamma ** step
-                raw[i_idx + step] += discount * (V / k)
-
-    # 50/50 blend with demo mean
+    # Stage 3: blend with demo mean
     scores = 0.5 * raw + 0.5 * raw.mean()
     return scores.astype(np.float32)

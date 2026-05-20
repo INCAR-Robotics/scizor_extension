@@ -56,7 +56,7 @@ def extract_chunk_embeddings(
         N    = len(frames)
         acts = actions_per_demo[demo_idx] if actions_per_demo is not None else None
 
-        for start in range(0, max(1, N - chunk_frames + 1), step):
+        for start in range(0, max(1, N), step):
             end = min(start + chunk_frames, N)
             window_frames = frames[start:end]
 

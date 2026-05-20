@@ -22,7 +22,7 @@ Add `scizor_full` to your preprocessing pipeline (after `sample_dt` and `downsam
     "pairs_per_demo": 500,
     "batch_size": 128,
     "lr": 1e-4,
-    "lookahead_steps": 5,
+    "lookahead_seconds": 2.0,
     "gamma": 0.9,
     "suboptimality_percentile": 25,
     "dedup_eps": 0.99,
@@ -61,12 +61,18 @@ A lightweight self-attention transformer is trained on frame pairs `(frame_i, fr
 
 Training is fully **self-supervised**: the ground-truth label is the actual elapsed time.
 
-At inference, each frame is scored:
+At inference, each frame is scored in two stages (SCIZOR §3.2):
 
 ```
-V_{i,i+T} = T_actual − T_predicted      # sub-trajectory score
-score(frame) = 0.5 × local_score        # temporally discounted sum of V
-             + 0.5 × demo_mean_score    # blended with demo average
+# Stage 1 — even distribution
+V_i    = T*dt − T_predicted(feat_i, feat_{i+T})
+Vhat[j] += V_i / T   for every j in [i, i+T]
+
+# Stage 2 — future-looking discounted sum
+score(j) = Σ_{k=0}^{T} γ^k · Vhat[j+k]
+
+# Stage 3 — demo-mean blend
+score = 0.5 × score + 0.5 × mean(score)
 ```
 
 **High score = idle/suboptimal.  Low score = productive frame.**
@@ -94,6 +100,8 @@ dedup_score          ≥  dedup_eps
 
 Both steps operate at the INCAR `DATASET` hook and modify the preprocessed dataset files in-place (video + HDF5 signals), keeping frame indices aligned across all features.
 
+**Temporal continuity**: removed frames create gaps in the trajectory. To avoid exposing policies to discontinuous observation histories, each demo is split at every gap into separate demo directories. Only runs of consecutive retained frames that are at least `min_demo_steps` long are kept. The resulting dataset contains strictly temporally contiguous demos.
+
 ---
 
 ## Configuration reference
@@ -103,7 +111,7 @@ Both steps operate at the INCAR `DATASET` hook and modify the preprocessed datas
 | Parameter | Pass | Paper value | Notes |
 |---|---|---|---|
 | `encoder` | Pass 1 — progress predictor | `dinov2_vitb14` | Per-frame CLS tokens fed to the transformer head. `dinov2_vits14` (384-d) is faster and works well in practice. |
-| `dedup_encoder` | Pass 2 — deduplication | `"cosmos"` | Encodes the full 2-second clip as a temporal sequence. Defaults to `null` (reuses `encoder`). |
+| `dedup_encoder` | Pass 2 — deduplication | `"cosmos"` | Encodes the full 2-second clip as a temporal sequence. Default: `"cosmos"`. Set to `null` to reuse `encoder` instead. |
 
 **`encoder` values:**
 
@@ -130,13 +138,15 @@ To match the paper exactly:
 | Parameter | Default | Paper value | Notes |
 |---|---|---|---|
 | `num_steps` | 10 000 | 10 000 | Training steps for Pass 1. |
+| `num_layers` | 6 | 6 | Transformer depth for the progress head. |
 | `batch_size` | 128 | 128 | Training batch size. |
 | `lr` | 1e-4 | 1e-4 | AdamW learning rate. |
-| `suboptimality_percentile` | 25 | — | Remove top N% by suboptimality. |
+| `suboptimality_threshold` | `null` | 0.58 | Fixed score threshold (paper: ε_s=0.58). When `null`, falls back to percentile. |
+| `suboptimality_percentile` | 25 | — | Used when `suboptimality_threshold` is null. Removes top N% by suboptimality score. |
 | `dedup_eps` | 0.99 | 0.99 | Cosine similarity duplicate threshold. |
 | `pairs_per_demo` | 500 | — | Frame pairs sampled per demo for training. |
-| `lookahead_steps` | 5 | — | Max frame gap for scoring (in frames at dataset dt). |
-| `gamma` | 0.9 | — | Temporal discount for score accumulation. |
+| `lookahead_seconds` | 2.0 | 2.0 | Fixed scoring window in seconds. Converted to frames at runtime as `round(lookahead_seconds / dt)`. |
+| `gamma` | 0.9 | — | Temporal discount for score distribution within the window. γ^0 on the start frame, γ^T on the end frame. |
 | `pca_components` | 128 | — | PCA dim before k-means; 0 to disable. |
 | `n_clusters` | 0 | — | k-means clusters; 0 = auto (`max(2, sqrt(n_chunks))`). |
 | `min_demo_steps` | 20 | — | Demos shorter than this are left untouched. |

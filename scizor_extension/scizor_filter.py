@@ -7,11 +7,28 @@ Implements the full two-pass SCIZOR pipeline from:
 
 Must be placed AFTER sample_dt and downsample_video so video frame indices
 are aligned 1-to-1 with HDF5 signal indices.
+
+Frame removal and temporal continuity
+--------------------------------------
+Removed frames create gaps in the original trajectory.  Rather than producing
+a demo where consecutive retained frames were never temporally adjacent (which
+would corrupt observation histories for any policy that uses a frame stack),
+this step splits each demo at discontinuities:
+
+  - Maximal runs of consecutive retained frames become separate demo directories
+    (demo_{N}, demo_{N+1}, …) appended to the dataset.
+  - Runs shorter than min_demo_steps are discarded entirely.
+  - If all runs are shorter than min_demo_steps, the contiguous window of that
+    length with the lowest total suboptimality score is kept as a fallback.
+
+The resulting demos are guaranteed to contain only frames that were originally
+adjacent in time.
 """
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 import av
 import numpy as np
@@ -62,10 +79,64 @@ def _apply_index_filter(
 def _print_summary(rows: list, total_before: int, total_after: int) -> None:
     pct = 100.0 * (1.0 - total_after / max(total_before, 1))
     print(f"\n[ScizorFull] {total_before} → {total_after} frames ({pct:.1f}% removed)")
-    print(f"  {'Demo':<16} {'Before':>7} {'After':>7} {'Removed%':>9}")
+    print(f"  {'Demo':<22} {'Before':>7} {'After':>7} {'Removed%':>9}")
     for demo, before, after in rows:
         r = 100.0 * (1.0 - after / max(before, 1))
-        print(f"  {demo:<16} {before:>7} {after:>7} {r:>8.1f}%")
+        print(f"  {demo:<22} {before:>7} {after:>7} {r:>8.1f}%")
+
+
+# --------------------------------------------------------------------------- #
+# Segment helpers
+# --------------------------------------------------------------------------- #
+
+def _find_contiguous_segments(indices: List[int], min_steps: int) -> List[List[int]]:
+    """Split a sorted index list into maximal contiguous runs, dropping runs < min_steps."""
+    if not indices:
+        return []
+    segments: List[List[int]] = []
+    current = [indices[0]]
+    for prev, curr in zip(indices[:-1], indices[1:]):
+        if curr == prev + 1:
+            current.append(curr)
+        else:
+            if len(current) >= min_steps:
+                segments.append(current)
+            current = [curr]
+    if len(current) >= min_steps:
+        segments.append(current)
+    return segments
+
+
+def _apply_segments(
+    root_path: str,
+    demo: str,
+    segments: List[List[int]],
+    config: "DatasetConfig",
+    next_idx: int,
+) -> Tuple[int, int]:
+    """
+    Write each contiguous segment as its own demo directory.
+
+    Segment 0 filters the original demo in-place.  Segments 1+ are written to
+    new demo_{next_idx} directories, copied from the unfiltered original BEFORE
+    any in-place write so that all copies contain the full source data.
+
+    Returns (total_frames_kept, updated_next_idx).
+    """
+    orig = Path(root_path) / demo
+    names = [demo]
+
+    # Create copies for segments 1+ before touching the original
+    for _ in range(1, len(segments)):
+        name = f"demo_{next_idx}"
+        shutil.copytree(str(orig), str(Path(root_path) / name))
+        names.append(name)
+        next_idx += 1
+
+    for name, seg in zip(names, segments):
+        _apply_index_filter(root_path, name, seg, config)
+
+    return sum(len(s) for s in segments), next_idx
 
 
 # =========================================================================== #
@@ -108,18 +179,22 @@ class ScizorFull(ProcessStep):
     encoder: str = "dinov2_vits14"
 
     # Pass 2: Cosmos-Tokenize encodes the full 2-second clip as a temporal
-    # sequence — the paper's method.  Defaults to None (reuses `encoder`).
-    # Requires: pip install git+https://github.com/NVIDIA/Cosmos-Tokenizer.git
-    dedup_encoder: Optional[str] = None
+    # sequence — the paper's method.  Set to None to reuse `encoder` instead.
+    dedup_encoder: Optional[str] = "cosmos"
 
     # --- Pass 1: progress predictor ---
     pairs_per_demo:           int   = 500
     num_steps:                int   = 10_000   # paper: 10 000
+    num_layers:               int   = 6        # paper: 6 transformer layers
     batch_size:               int   = 128       # paper: 128
     lr:                       float = 1e-4      # paper: 1e-4
-    lookahead_steps:          int   = 5
-    gamma:                    float = 0.9       # temporal discount
-    suboptimality_percentile: int   = 25        # remove top N% by suboptimality
+    # Paper uses a fixed 2s scoring window regardless of dataset dt.
+    lookahead_seconds:        float = 2.0
+    gamma:                    float = 0.9   # temporal discount for score distribution
+    # Suboptimality filter: use a fixed score threshold (paper: ε_s=0.58) or
+    # a percentile fallback when the threshold is None.
+    suboptimality_threshold:  Optional[float] = None   # paper: 0.58
+    suboptimality_percentile: int             = 25     # used when threshold is None
 
     # --- Pass 2: deduplication ---
     dedup_eps:      float = 0.99   # paper: ε_d = 0.99
@@ -183,13 +258,20 @@ class ScizorFull(ProcessStep):
 
         print("\n[ScizorFull] Filtering …")
         all_sub = np.concatenate(sub_scores)
-        sub_threshold = float(np.percentile(all_sub, 100 - self.suboptimality_percentile))
-        print(f"  suboptimality threshold (p{100 - self.suboptimality_percentile}): "
-              f"{sub_threshold:.4f}  →  removes top {self.suboptimality_percentile}%")
+        if self.suboptimality_threshold is not None:
+            sub_threshold = float(self.suboptimality_threshold)
+            pct_removed = 100.0 * (all_sub > sub_threshold).mean()
+            print(f"  suboptimality threshold (fixed ε_s={sub_threshold}): "
+                  f"removes {pct_removed:.1f}% of frames")
+        else:
+            sub_threshold = float(np.percentile(all_sub, 100 - self.suboptimality_percentile))
+            print(f"  suboptimality threshold (p{100 - self.suboptimality_percentile}): "
+                  f"{sub_threshold:.4f}  →  removes top {self.suboptimality_percentile}%")
         print(f"  dedup eps: {self.dedup_eps}")
 
         total_before = total_after = 0
         rows = []
+        next_demo_idx = max(int(d.split("_")[-1]) for d in demos) + 1
 
         for i, demo in enumerate(demos):
             N = len(frames_per_demo[i])
@@ -202,20 +284,34 @@ class ScizorFull(ProcessStep):
 
             remove = (sub_scores[i] > sub_threshold) | (dedup_scores[i] >= self.dedup_eps)
             keep   = ~remove
-            keep[0] = keep[-1] = True
+            keep[0] = True      # always keep the first frame
 
-            if keep.sum() < self.min_demo_steps:
-                order = np.argsort(sub_scores[i])
-                keep  = np.zeros(N, dtype=bool)
-                keep[order[: self.min_demo_steps]] = True
-                keep[0] = keep[-1] = True
+            indices  = np.where(keep)[0].tolist()
+            segments = _find_contiguous_segments(indices, self.min_demo_steps)
 
-            indices = np.where(keep)[0].tolist()
-            total_after += len(indices)
-            rows.append((demo, N, len(indices)))
+            if not segments:
+                # All contiguous runs are too short.  Find the window of
+                # min_demo_steps consecutive frames with the lowest total
+                # suboptimality score — guaranteed to be contiguous.
+                M           = min(self.min_demo_steps, N)
+                window_sums = np.convolve(sub_scores[i], np.ones(M), mode='valid')
+                best_start  = int(np.argmin(window_sums))
+                segments    = [list(range(best_start, best_start + M))]
 
-            if len(indices) < N:
-                _apply_index_filter(root_path, demo, indices, config)
+            n_segs    = len(segments)
+            seg_total = sum(len(s) for s in segments)
+            total_after += seg_total
+
+            label = demo if n_segs == 1 else f"{demo} →{n_segs} segs"
+            rows.append((label, N, seg_total))
+
+            if seg_total < N or n_segs > 1:
+                if n_segs == 1:
+                    _apply_index_filter(root_path, demo, segments[0], config)
+                else:
+                    _, next_demo_idx = _apply_segments(
+                        root_path, demo, segments, config, next_demo_idx
+                    )
 
         _print_summary(rows, total_before, total_after)
 
@@ -243,12 +339,13 @@ class ScizorFull(ProcessStep):
             features_per_demo, dt=dt, device=self._device,
             pairs_per_demo=self.pairs_per_demo, num_steps=self.num_steps,
             batch_size=self.batch_size, lr=self.lr, feat_dim=self._enc.feat_dim,
+            num_layers=self.num_layers,
         )
 
-        print("[ScizorFull] Pass 1 — scoring frames …")
+        T = max(1, round(self.lookahead_seconds / dt))
+        print(f"[ScizorFull] Pass 1 — scoring frames (T={T} steps = {T * dt:.2f}s) …")
         return [
-            score_demo(feats, model, self._device, dt,
-                       lookahead_steps=self.lookahead_steps, gamma=self.gamma)
+            score_demo(feats, model, self._device, dt, lookahead_steps=T, gamma=self.gamma)
             for feats in tqdm(features_per_demo, desc="  scoring")
         ]
 
