@@ -238,6 +238,9 @@ class CosmosEncoder(VisualEncoder):
         for frames in chunks:
             idx = np.linspace(0, len(frames) - 1, min(n_subsample, len(frames)), dtype=int)
             sub_frames = [frames[i] for i in idx]
+            # Pad to exactly n_subsample frames so the temporal latent dim is constant
+            while len(sub_frames) < n_subsample:
+                sub_frames.append(sub_frames[-1])
             video = self._make_video_tensor(sub_frames)
             with torch.no_grad():
                 latent = self._tokenizer.encode(video)[0]
